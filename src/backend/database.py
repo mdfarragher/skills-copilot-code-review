@@ -5,11 +5,117 @@ MongoDB database configuration and setup for Mergington High School API
 from pymongo import MongoClient
 from argon2 import PasswordHasher, exceptions as argon2_exceptions
 
+
+class _UpdateResult:
+    def __init__(self, modified_count: int):
+        self.modified_count = modified_count
+
+
+class InMemoryCollection:
+    def __init__(self):
+        self._docs = []
+
+    def count_documents(self, query):
+        return len(list(self.find(query)))
+
+    def insert_one(self, doc):
+        self._docs.append(dict(doc))
+
+    def find(self, query):
+        query = query or {}
+        for doc in self._docs:
+            if self._matches(doc, query):
+                yield dict(doc)
+
+    def find_one(self, query):
+        for doc in self.find(query):
+            return doc
+        return None
+
+    def update_one(self, query, update):
+        for idx, doc in enumerate(self._docs):
+            if self._matches(doc, query):
+                updated_doc = dict(doc)
+
+                if "$push" in update:
+                    for key, value in update["$push"].items():
+                        current = list(updated_doc.get(key, []))
+                        current.append(value)
+                        updated_doc[key] = current
+
+                if "$pull" in update:
+                    for key, value in update["$pull"].items():
+                        current = list(updated_doc.get(key, []))
+                        updated_doc[key] = [item for item in current if item != value]
+
+                self._docs[idx] = updated_doc
+                return _UpdateResult(modified_count=1)
+
+        return _UpdateResult(modified_count=0)
+
+    def aggregate(self, pipeline):
+        if pipeline == [
+            {"$unwind": "$schedule_details.days"},
+            {"$group": {"_id": "$schedule_details.days"}},
+            {"$sort": {"_id": 1}}
+        ]:
+            unique_days = set()
+            for doc in self._docs:
+                schedule_details = doc.get("schedule_details", {})
+                for day in schedule_details.get("days", []):
+                    unique_days.add(day)
+
+            for day in sorted(unique_days):
+                yield {"_id": day}
+            return
+
+        raise NotImplementedError("Unsupported aggregation pipeline in InMemoryCollection")
+
+    def _matches(self, doc, query):
+        for key, condition in query.items():
+            value = self._get_nested(doc, key)
+
+            if isinstance(condition, dict):
+                if "$in" in condition:
+                    candidates = condition["$in"]
+                    if isinstance(value, list):
+                        if not any(item in value for item in candidates):
+                            return False
+                    elif value not in candidates:
+                        return False
+                if "$gte" in condition and value < condition["$gte"]:
+                    return False
+                if "$lte" in condition and value > condition["$lte"]:
+                    return False
+            else:
+                if value != condition:
+                    return False
+
+        return True
+
+    @staticmethod
+    def _get_nested(doc, dotted_key):
+        value = doc
+        for part in dotted_key.split('.'):
+            if not isinstance(value, dict):
+                return None
+            value = value.get(part)
+            if value is None:
+                return None
+        return value
+
 # Connect to MongoDB
-client = MongoClient('mongodb://localhost:27017/')
-db = client['mergington_high']
-activities_collection = db['activities']
-teachers_collection = db['teachers']
+try:
+    client = MongoClient('mongodb://localhost:27017/', serverSelectionTimeoutMS=1000)
+    client.admin.command('ping')
+    db = client['mergington_high']
+    activities_collection = db['activities']
+    teachers_collection = db['teachers']
+except Exception:
+    client = None
+    db = None
+    activities_collection = InMemoryCollection()
+    teachers_collection = InMemoryCollection()
 
 # Methods
 
